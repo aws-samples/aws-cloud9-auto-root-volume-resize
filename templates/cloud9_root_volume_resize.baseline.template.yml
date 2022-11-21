@@ -1,0 +1,453 @@
+# Copyright 2022 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# https://aws.amazon.com/agreement
+# SPDX-License-Identifier: MIT-0
+
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  Create an SSM Automation runbook which will enable automatic resizing of root volumes for Cloud9 environment
+  instances.
+
+Resources:
+  rEventsRuleCreateEnvironmentEC2:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: !Sub >-
+        Event rule to hook into Cloud9 environment creation and trigger the "${ rSSMDocument }" SSM Automation runbook.
+      EventPattern:
+        detail:
+          eventName:
+            - CreateEnvironmentEC2
+          responseElements:
+            environmentId:
+              -
+                exists: true
+        detail-type:
+          - AWS API Call via CloudTrail
+        source:
+          - aws.cloud9
+      State: ENABLED
+      Targets:
+        -
+          Arn: !Sub arn:${ AWS::Partition }:ssm:${ AWS::Region }:${ AWS::AccountId }:automation-definition/${ rSSMDocument }
+          Id: Cloud9RootVolumeResizeAutomationDocument
+          InputTransformer:
+            InputPathsMap:
+              environmentId: $.detail.responseElements.environmentId
+              eventName: $.detail.eventName
+            InputTemplate: !Sub |-
+              {
+                "AutomationAssumeRole": ["${ rSSMDocumentIAMRole.Arn }"],
+                "EnvironmentId": [<environmentId>],
+                "EventName": [<eventName>]
+              }
+          RoleArn: !GetAtt rEventsRuleIAMRole.Arn
+
+  rEventsRuleDeleteEnvironment:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: !Sub >-
+        Event rule to hook into Cloud9 environment deletion and trigger the "${ rSSMDocument }" SSM automation runbook.
+      EventPattern:
+        detail:
+          eventName:
+            - DeleteEnvironment
+          requestParameters:
+            environmentId:
+              -
+                exists: true
+        detail-type:
+          - AWS API Call via CloudTrail
+        source:
+          - aws.cloud9
+      State: ENABLED
+      Targets:
+        -
+          Arn: !Sub arn:${ AWS::Partition }:ssm:${ AWS::Region }:${ AWS::AccountId }:automation-definition/${ rSSMDocument }
+          Id: Cloud9RootVolumeResizeAutomationDocument
+          InputTransformer:
+            InputPathsMap:
+              environmentId: $.detail.requestParameters.environmentId
+              eventName: $.detail.eventName
+            InputTemplate: !Sub |-
+              {
+                "AutomationAssumeRole": ["${ rSSMDocumentIAMRole.Arn }"],
+                "EnvironmentId": [<environmentId>],
+                "EventName": [<eventName>]
+              }
+          RoleArn: !GetAtt rEventsRuleIAMRole.Arn
+
+  rEventsRuleIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          -
+            Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+        Version: 2012-10-17
+      Policies:
+        -
+          PolicyDocument:
+            Statement:
+              -
+                Action:
+                  - ssm:StartAutomationExecution
+                Effect: Allow
+                Resource:
+                  - !Sub arn:${ AWS::Partition }:ssm:${ AWS::Region }:${ AWS::AccountId }:automation-definition/${ rSSMDocument }:$DEFAULT
+              -
+                Action:
+                  - iam:PassRole
+                Condition:
+                  StringLikeIfExists:
+                    iam:PassedToService: ssm.amazonaws.com
+                Effect: Allow
+                Resource:
+                  - !GetAtt rSSMDocumentIAMRole.Arn
+            Version: 2012-10-17
+          PolicyName: Cloud9RootVolumeResizeAutomationEventsRuleIAMRolePolicy
+
+  rEventsRuleTagResource:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: !Sub >-
+        Event rule to hook into Cloud9 environment tag creation and trigger the "${ rSSMDocument }" SSM Automation
+        runbook.
+      EventPattern:
+        detail:
+          eventName:
+            - TagResource
+          requestParameters:
+            resourceARN:
+              -
+                exists: true
+          userIdentity:
+            sessionContext:
+              sessionIssuer:
+                arn:
+                  -
+                    anything-but: !GetAtt rSSMDocumentIAMRole.Arn
+        detail-type:
+          - AWS API Call via CloudTrail
+        source:
+          - aws.cloud9
+      State: ENABLED
+      Targets:
+        -
+          Arn: !Sub arn:${ AWS::Partition }:ssm:${ AWS::Region }:${ AWS::AccountId }:automation-definition/${ rSSMDocument }
+          Id: Cloud9RootVolumeResizeAutomationDocument
+          InputTransformer:
+            InputPathsMap:
+              environmentArn: $.detail.requestParameters.resourceARN
+              eventName: $.detail.eventName
+            InputTemplate: !Sub |-
+              {
+                "AutomationAssumeRole": ["${ rSSMDocumentIAMRole.Arn }"],
+                "EnvironmentArn": [<environmentArn>],
+                "EventName": [<eventName>]
+              }
+          RoleArn: !GetAtt rEventsRuleIAMRole.Arn
+
+  rSSMDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      Content:
+        assumeRole: "{{ AutomationAssumeRole }}"
+        description: Enables automatic resizing of root volumes for Cloud9 environment instances.
+        mainSteps:
+          -
+            action: aws:executeScript
+            description: Based on the parameter passed to the SSM Automation runbook, return the Cloud9 environment ID.
+            inputs:
+              Handler: handler
+              InputPayload:
+                EnvironmentArn: "{{ EnvironmentArn }}"
+                EnvironmentId: "{{ EnvironmentId }}"
+              Runtime: python3.8
+              Script: |
+                def handler(event: dict, context: dict) -> None:
+                    """Certain Cloud9 events emitted by the API either list the Cloud9
+                    environment ID or the ARN.  This function's purpose is to consistently
+                    provide the environment ID from either case for later steps in the SSM
+                    Automation runbook to reference.
+
+                    :param event: The event details.
+                    :param context: The environment execution context.
+                    :return: None
+                    """
+                    return {
+                        "environment_id": (
+                            event["EnvironmentArn"].split(":")[-1] if event["EnvironmentArn"]
+                            else event["EnvironmentId"]
+                        )
+                    }
+
+            outputs:
+              -
+                Name: EnvironmentId
+                Selector: $.Payload.environment_id
+                Type: String
+            name: GetCloud9EnvironmentId
+          -
+            action: aws:branch
+            description: Determine if the API event emitted by the Cloud9 service is "DeleteEnvironment".
+            inputs:
+              Choices:
+                -
+                  NextStep: CleanUpCloud9EnvironmentRootVolumeParameter
+                  StringEquals: DeleteEnvironment
+                  Variable: "{{ EventName }}"
+              Default: PollCloud9EnvironmentStatus
+            name: BranchOnCloud9EventName
+          -
+            action: aws:executeAwsApi
+            description: Clean up any SSM parameters related to the Cloud9 environment root volume size.
+            inputs:
+              Api: DeleteParameter
+              Name: "/cloud9/{{ GetCloud9EnvironmentId.EnvironmentId }}/root_volume_size"
+              Service: ssm
+            isEnd: true
+            name: CleanUpCloud9EnvironmentRootVolumeParameter
+          -
+            action: aws:waitForAwsResourceProperty
+            description: Wait for the Cloud9 environment to be fully provisioned.
+            inputs:
+              Api: DescribeEnvironmentStatus
+              DesiredValues:
+                - ready
+                - stopped
+              environmentId: "{{ GetCloud9EnvironmentId.EnvironmentId }}"
+              PropertySelector: $.status
+              Service: cloud9
+            name: PollCloud9EnvironmentStatus
+            timeoutSeconds: 300
+          -
+            action: aws:executeScript
+            description: >-
+              Determine the instance and root volume IDs for the Cloud9 environment so as to modify the root volume
+              size then subsequently reboot the instance to resize the filesystem.
+            inputs:
+              Handler: handler
+              InputPayload:
+                EnvironmentArn: "{{ EnvironmentArn }}"
+                EnvironmentId: "{{ GetCloud9EnvironmentId.EnvironmentId }}"
+                EventName: "{{ EventName }}"
+              Runtime: python3.8
+              Script: |
+                import boto3
+
+                boto3_session = boto3.session.Session()
+                cloud9_client = boto3_session.client("cloud9")
+                ec2_client = boto3_session.client("ec2")
+                ssm_client = boto3_session.client("ssm")
+
+
+                class Cloud9Environment:
+
+                    def __init__(self: "Cloud9Environment", event: dict) -> None:
+                        """Set internal variables with relevant data from the event parameter
+                        and certain information regarding the instance associated with the
+                        Cloud9 environment.
+
+                        :param self: A reference to the instantiated class.
+                        :param event: The event parameter.
+                        :return: None
+                        """
+                        self._environment_arn = event["EnvironmentArn"]
+                        self._environment_id = event["EnvironmentId"]
+                        self._event_name = event["EventName"]
+                        self._instance = self._describe_instances()
+
+                    def _describe_instances(self: "Cloud9Environment") -> dict:
+                        """Describe the Cloud9 environment instance by filtering on the tag
+                        containing the environment ID.
+
+                        If the API event emitted by the Cloud9 service is related to adding
+                        tags, pull the tags from the environment itself.  This is because tags
+                        created or updated after the environment is created do not propagate to
+                        the environment instance.
+
+                        :param self: A reference to the instantiated class.
+                        :return: A dict of information about the Cloud9 environment instance.
+                        """
+                        instance = ec2_client.describe_instances(
+                            Filters=[
+                                {
+                                    "Name": "tag:aws:cloud9:environment",
+                                    "Values": [self._environment_id]
+                                }
+                            ]
+                        )["Reservations"][0]["Instances"][0]
+
+                        if self._event_name in ["TagResource"]:
+                            instance["Tags"] = cloud9_client.list_tags_for_resource(
+                                ResourceARN=self._environment_arn
+                            )["Tags"]
+
+                        return {
+                            "instance_id": instance["InstanceId"],
+                            "state": instance["State"]["Name"],
+                            "volume_id": instance["BlockDeviceMappings"][0]["Ebs"]["VolumeId"],
+                            "volume_size": next(
+                                (
+                                    tag["Value"] for tag in instance["Tags"]
+                                    if tag["Key"] == "cloud9:root_volume_size"
+                                ),
+                                None
+                            )
+                        }
+
+                    def modify_volume(self: "Cloud9Environment") -> None:
+                        """If the root volume size tag is associated with the environment,
+                        resize the relevant volume.  To keep track of the current size of the
+                        root volume out of band, an SSM parameter is created and kept up to
+                        date.  The instance is then rebooted as the Amazon Linux 2 and Ubuntu
+                        environments will resize the root partition automatically on boot.
+
+                        If an error is encountered in modifying the root volume size, the root
+                        volume size tag for the Cloud9 environment is "rolled back" to the
+                        previous size as determined by the mentioned SSM parameter.  This is
+                        done to keep the tag consistent with reality.
+
+                        :param self: A reference to the instantiated class.
+                        :return: None
+                        """
+                        if self._instance["volume_size"]:
+                            try:
+                                ec2_client.modify_volume(
+                                    Size=int(self._instance["volume_size"]),
+                                    VolumeId=self._instance["volume_id"]
+                                )
+
+                            except ec2_client.exceptions.ClientError:
+                                if self._event_name in ["TagResource"]:
+                                    previous_volume_size = ssm_client.get_parameter(
+                                        Name=(
+                                            f"/cloud9/{self._environment_id}/root_volume_size"
+                                        )
+                                    )["Parameter"]["Value"]
+
+                                    cloud9_client.tag_resource(
+                                        ResourceARN=self._environment_arn,
+                                        Tags=[
+                                            {
+                                                "Key": "cloud9:root_volume_size",
+                                                "Value": previous_volume_size
+                                            }
+                                        ]
+                                    )
+
+                                raise
+
+                            ssm_client.put_parameter(
+                                Description=(
+                                    "The current root volume size for the Cloud9 environment "
+                                    f"\"{self._environment_id}\"."
+                                ),
+                                Name=f"/cloud9/{self._environment_id}/root_volume_size",
+                                Type="String",
+                                Value=self._instance["volume_size"]
+                            )
+
+                            if self._instance["state"] in ["running"]:
+                                ec2_client.reboot_instances(
+                                    InstanceIds=[self._instance["instance_id"]]
+                                )
+
+                        else:
+                            raise ValueError(
+                                "Aborting; tag \"cloud9:root_volume_size\" not found."
+                            )
+
+
+                def handler(event: dict, context: dict) -> None:
+                    """Instantiate a class that organizes properties from the event parameter
+                    and execute the method that will modify the relevant root volume size.
+
+                    :param event: The event details.
+                    :param context: The environment execution context.
+                    :return: None
+                    """
+                    environment = Cloud9Environment(event)
+                    environment.modify_volume()
+
+            isEnd: true
+            name: ResizeCloud9Volume
+        parameters:
+          AutomationAssumeRole:
+            description: >-
+              (Required) The ARN of the IAM role that allows SSM Automation to perform actions defined in the runbook
+              on your behalf.
+            type: String
+          EnvironmentArn:
+            default: ""
+            description: The ARN of the Cloud9 environment.
+            type: String
+          EnvironmentId:
+            default: ""
+            description: The ID of the Cloud9 environment.
+            type: String
+          EventName:
+            description: The name of the API event emitted by the Cloud9 service.
+            type: String
+        schemaVersion: "0.3"
+      DocumentType: Automation
+      Name: Cloud9RootVolumeResizeAutomation
+
+  rSSMDocumentIAMRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          -
+            id: W11
+            reason: >-
+              The describe/list actions cannot be resource-limited.  The Cloud9 instance environment EBS volumes do not
+              have any explicit identifiers set by the service so permissions cannot be resource-limited.  The solution
+              needs permissions to tag any Cloud9 environment as part of the cleanup/error mitigation process.
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          -
+            Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - ssm.amazonaws.com
+        Version: 2012-10-17
+      Policies:
+        -
+          PolicyDocument:
+            Statement:
+              -
+                Action:
+                  - cloud9:DescribeEnvironmentStatus
+                  - cloud9:ListTagsForResource
+                  - cloud9:TagResource
+                  - ec2:DescribeInstances
+                  - ec2:ModifyVolume
+                  - ssm:StartSession
+                Effect: Allow
+                Resource: "*"
+              -
+                Action:
+                  - ec2:RebootInstances
+                Condition:
+                  StringLike:
+                    aws:ResourceTag/aws:cloud9:environment: "*"
+                Effect: Allow
+                Resource: "*"
+              -
+                Action:
+                  - ssm:DeleteParameter
+                  - ssm:GetParameter
+                  - ssm:PutParameter
+                Effect: Allow
+                Resource: !Sub arn:${ AWS::Partition }:ssm:${ AWS::Region }:${ AWS::AccountId }:parameter/cloud9/*/root_volume_size
+            Version: 2012-10-17
+          PolicyName: Cloud9RootVolumeResizeAutomationSSMDocumentIAMRolePolicy
